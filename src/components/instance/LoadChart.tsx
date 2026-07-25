@@ -473,7 +473,7 @@ export function LoadChart({
         const next = arr[index + 1];
         return !next || Math.abs(next.time - point.time) >= 1;
       });
-      // 实时模式下只保留最近 5 分钟内的数据，保证采样密度均匀
+      // 实时模式下只保留最近 10 分钟内的数据，保证采样密度均匀
       const latestTime = deduped[deduped.length - 1]?.time;
       if (latestTime != null) {
         return deduped.filter((p) => latestTime - p.time <= REALTIME_WINDOW_SECONDS).slice(-REALTIME_SAMPLE_LIMIT);
@@ -500,7 +500,7 @@ export function LoadChart({
     : "—";
   const requestedXRange = useMemo(() => {
     if (isRealtime) {
-      // 实时模式：动态 5 分钟滑动窗口，起始时间和最新时间随数据实时滚动
+      // 实时模式：动态 10 分钟滑动窗口，起始时间和最新时间随数据实时滚动
       const latestTime = points[points.length - 1]?.time;
       if (latestTime != null) {
         return [latestTime - REALTIME_WINDOW_SECONDS, latestTime] as [number, number];
