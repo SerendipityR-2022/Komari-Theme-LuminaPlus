@@ -37,9 +37,8 @@ import type { LoadRecord, NodeMetrics } from "@/types/komari";
 
 const LOAD_HISTORY_SAMPLE_LIMIT = 360;
 const LOAD_HISTORY_RENDER_LIMIT = 720;
-const REALTIME_HISTORY_SEED_LIMIT = 120;
 const REALTIME_SAMPLE_LIMIT = 600;
-const REALTIME_WINDOW_SECONDS = 600; // 实时模式下时间窗口：10 分钟
+const REALTIME_WINDOW_SECONDS = 300; // 实时模式下时间窗口：5 分钟
 
 const CPU_KEYS = ["cpu"];
 const CPU_COLORS = [CHART_PALETTE.cpu];
@@ -292,18 +291,14 @@ const ChartCard = memo(function ChartCard({
     dataRef.current = data;
   }, [data]);
 
-  // 实时模式下，用 ref 存储动态 xRange 并原地更新数组值，
-  // 避免每次 tick 新建数组引用导致 chartOptions 链路重建 → uPlot 重绘"动画"。
+  // 实时模式下通过 setScale 更新 x 轴范围，避免 chartOptions 重建导致重绘
   const isRealtimeChart = rangeHours === 0;
-  const xRangeRef = useRef<[number, number] | undefined>(undefined);
-  if (isRealtimeChart && xRange) {
-    if (xRangeRef.current) {
-      xRangeRef.current[0] = xRange[0];
-      xRangeRef.current[1] = xRange[1];
-    } else {
-      xRangeRef.current = [xRange[0], xRange[1]];
-    }
-  }
+  const uPlotRef = useRef<uPlot | null>(null);
+  useEffect(() => {
+    const inst = uPlotRef.current;
+    if (!inst || !isRealtimeChart || !xRange) return;
+    inst.setScale("x", { min: xRange[0], max: xRange[1] });
+  }, [isRealtimeChart, xRange]);
 
   const baseOptions = useMemo(
     () =>
@@ -319,7 +314,6 @@ const ChartCard = memo(function ChartCard({
         axisSize,
         xRange: isRealtimeChart ? null : xRange,
       }),
-    // 实时模式下不在 deps 中依赖 xRange，改用 ref 驱动
     [axisKind, axisSize, colors, keys, rangeHours, resolvedAppearance, spanGaps, title, unit, isRealtimeChart ? undefined : xRange],
   );
 
@@ -353,12 +347,27 @@ const ChartCard = memo(function ChartCard({
 
   const chartOptions = useMemo<uPlot.Options>(() => {
     const opts = { ...enhancedOptions, width: w, height: h };
-    // 实时模式：用 ref 驱动的 range 函数替换 x 轴，不产生新引用
-    if (isRealtimeChart) {
-      opts.scales = {
-        ...opts.scales,
-        x: { time: true, auto: false, range: () => xRangeRef.current ?? undefined as any },
-      };
+    // 实时模式下在 x 轴上抑制连续重复的时间标签（数据跨度短时同一分钟可能出现多个刻度）
+    if (isRealtimeChart && Array.isArray(opts.axes) && opts.axes[0]) {
+      const xAxis = opts.axes[0] as uPlot.Axis;
+      const originalValues = xAxis.values;
+      opts.axes = [
+        {
+          ...xAxis,
+          values: (u: uPlot, splits: number[], axisIdx: number, foundSpace: number, foundIncr: number) => {
+            const labels: (string | number | null)[] = typeof originalValues === "function"
+              ? originalValues(u, splits, axisIdx, foundSpace, foundIncr)
+              : splits.map(String);
+            let last: string | number | null = null;
+            return labels.map((label) => {
+              if (label === last) return "";
+              last = label;
+              return label ?? "";
+            });
+          },
+        } as uPlot.Axis,
+        ...opts.axes.slice(1),
+      ];
     }
     return opts as uPlot.Options;
   }, [enhancedOptions, w, h, isRealtimeChart]);
@@ -383,7 +392,8 @@ const ChartCard = memo(function ChartCard({
           key={`${uuid}-${rangeHours}`}
           options={chartOptions}
           data={data}
-          resetScales={rangeHours === 0}
+          onCreate={(inst) => { uPlotRef.current = inst; }}
+          onDelete={() => { uPlotRef.current = null; }}
         />
         <ChartTooltip tooltip={tooltip} />
       </div>
@@ -400,13 +410,13 @@ export function LoadChart({
   hours: number;
   active?: boolean;
 }) {
-  const queryHours = hours === 0 ? 1 : hours;
+  const isRealtime = hours === 0;
+  const queryHours = isRealtime ? 0 : hours;
   const { data, isError, isFetching, isLoading, refetch } = useLoadRecords(
     uuid,
     queryHours,
-    active,
+    active && !isRealtime,
   );
-  const isRealtime = hours === 0;
   const node = useNodeMetrics(uuid, isRealtime && active);
   const meta = useNodeMeta(uuid);
   const { resolvedAppearance } = usePreferences();
@@ -467,18 +477,13 @@ export function LoadChart({
 
   const points = useMemo<ChartPoint[]>(() => {
     if (isRealtime) {
-      const initial = historyPoints.slice(-REALTIME_HISTORY_SEED_LIMIT);
-      const merged = [...initial, ...realtimePoints].sort((a, b) => a.time - b.time);
-      const deduped = merged.filter((point, index, arr) => {
-        const next = arr[index + 1];
-        return !next || Math.abs(next.time - point.time) >= 1;
-      });
-      // 实时模式下只保留最近 10 分钟内的数据，保证采样密度均匀
-      const latestTime = deduped[deduped.length - 1]?.time;
+      if (realtimePoints.length === 0) return [];
+      // 实时模式下只保留最近 5 分钟内的数据，保证采样密度均匀
+      const latestTime = realtimePoints[realtimePoints.length - 1]?.time;
       if (latestTime != null) {
-        return deduped.filter((p) => latestTime - p.time <= REALTIME_WINDOW_SECONDS).slice(-REALTIME_SAMPLE_LIMIT);
+        return realtimePoints.filter((p) => latestTime - p.time <= REALTIME_WINDOW_SECONDS);
       }
-      return deduped.slice(-REALTIME_SAMPLE_LIMIT);
+      return realtimePoints;
     }
     return historyPoints;
   }, [historyPoints, isRealtime, realtimePoints]);
@@ -500,9 +505,13 @@ export function LoadChart({
     : "—";
   const requestedXRange = useMemo(() => {
     if (isRealtime) {
-      // 实时模式：动态 10 分钟滑动窗口，起始时间和最新时间随数据实时滚动
       const latestTime = points[points.length - 1]?.time;
-      if (latestTime != null) {
+      const earliestTime = points[0]?.time;
+      if (latestTime != null && earliestTime != null) {
+        // 数据不足 5 分钟时动态拓展，达到后切换为滑动窗口
+        if (latestTime - earliestTime < REALTIME_WINDOW_SECONDS) {
+          return [earliestTime, latestTime] as [number, number];
+        }
         return [latestTime - REALTIME_WINDOW_SECONDS, latestTime] as [number, number];
       }
       return null;
@@ -517,11 +526,11 @@ export function LoadChart({
     [data, isRealtime, points],
   );
 
-  if (isLoading) {
+  if (!isRealtime && isLoading) {
     return <InstanceChartLoading title="负载图表" />;
   }
 
-  if (isError && !points.length) {
+  if (!isRealtime && isError && !points.length) {
     return (
       <InstancePanel title="负载图表">
         <div className="instance-empty">
@@ -543,7 +552,9 @@ export function LoadChart({
   if (!points.length) {
     return (
       <InstancePanel title="负载图表">
-        <div className="instance-empty">暂无负载历史数据</div>
+        <div className="instance-empty">
+          {isRealtime ? "等待实时数据..." : "暂无负载历史数据"}
+        </div>
       </InstancePanel>
     );
   }
