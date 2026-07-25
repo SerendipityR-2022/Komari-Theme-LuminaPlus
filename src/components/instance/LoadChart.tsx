@@ -39,6 +39,7 @@ const LOAD_HISTORY_SAMPLE_LIMIT = 360;
 const LOAD_HISTORY_RENDER_LIMIT = 720;
 const REALTIME_HISTORY_SEED_LIMIT = 120;
 const REALTIME_SAMPLE_LIMIT = 600;
+const REALTIME_WINDOW_SECONDS = 600; // 实时模式下时间窗口：10 分钟
 
 const CPU_KEYS = ["cpu"];
 const CPU_COLORS = [CHART_PALETTE.cpu];
@@ -290,6 +291,20 @@ const ChartCard = memo(function ChartCard({
   useLayoutEffect(() => {
     dataRef.current = data;
   }, [data]);
+
+  // 实时模式下，用 ref 存储动态 xRange 并原地更新数组值，
+  // 避免每次 tick 新建数组引用导致 chartOptions 链路重建 → uPlot 重绘"动画"。
+  const isRealtimeChart = rangeHours === 0;
+  const xRangeRef = useRef<[number, number] | undefined>(undefined);
+  if (isRealtimeChart && xRange) {
+    if (xRangeRef.current) {
+      xRangeRef.current[0] = xRange[0];
+      xRangeRef.current[1] = xRange[1];
+    } else {
+      xRangeRef.current = [xRange[0], xRange[1]];
+    }
+  }
+
   const baseOptions = useMemo(
     () =>
       buildBaseOptions({
@@ -302,9 +317,10 @@ const ChartCard = memo(function ChartCard({
         spanGaps,
         axisKind,
         axisSize,
-        xRange,
+        xRange: isRealtimeChart ? null : xRange,
       }),
-    [axisKind, axisSize, colors, keys, rangeHours, resolvedAppearance, spanGaps, title, unit, xRange],
+    // 实时模式下不在 deps 中依赖 xRange，改用 ref 驱动
+    [axisKind, axisSize, colors, keys, rangeHours, resolvedAppearance, spanGaps, title, unit, isRealtimeChart ? undefined : xRange],
   );
 
   const enhancedOptions = useMemo<Omit<uPlot.Options, "width" | "height">>(() => {
@@ -335,10 +351,17 @@ const ChartCard = memo(function ChartCard({
     };
   }, [colors, keys, baseOptions, rangeHours, unit]);
 
-  const chartOptions = useMemo<uPlot.Options>(
-    () => ({ ...enhancedOptions, width: w, height: h }) as uPlot.Options,
-    [enhancedOptions, w, h],
-  );
+  const chartOptions = useMemo<uPlot.Options>(() => {
+    const opts = { ...enhancedOptions, width: w, height: h };
+    // 实时模式：用 ref 驱动的 range 函数替换 x 轴，不产生新引用
+    if (isRealtimeChart) {
+      opts.scales = {
+        ...opts.scales,
+        x: { time: true, auto: false, range: () => xRangeRef.current ?? undefined as any },
+      };
+    }
+    return opts as uPlot.Options;
+  }, [enhancedOptions, w, h, isRealtimeChart]);
 
   return (
     <div
@@ -450,6 +473,11 @@ export function LoadChart({
         const next = arr[index + 1];
         return !next || Math.abs(next.time - point.time) >= 1;
       });
+      // 实时模式下只保留最近 5 分钟内的数据，保证采样密度均匀
+      const latestTime = deduped[deduped.length - 1]?.time;
+      if (latestTime != null) {
+        return deduped.filter((p) => latestTime - p.time <= REALTIME_WINDOW_SECONDS).slice(-REALTIME_SAMPLE_LIMIT);
+      }
       return deduped.slice(-REALTIME_SAMPLE_LIMIT);
     }
     return historyPoints;
@@ -470,10 +498,17 @@ export function LoadChart({
   const coverageSummary = points.length
     ? `${formatChartCoverageTime(points[0].time)} - ${formatChartCoverageTime(points[points.length - 1].time)}`
     : "—";
-  const requestedXRange = useMemo(
-    () => (isRealtime ? null : historyChartRangeSeconds(data)),
-    [data, isRealtime],
-  );
+  const requestedXRange = useMemo(() => {
+    if (isRealtime) {
+      // 实时模式：动态 5 分钟滑动窗口，起始时间和最新时间随数据实时滚动
+      const latestTime = points[points.length - 1]?.time;
+      if (latestTime != null) {
+        return [latestTime - REALTIME_WINDOW_SECONDS, latestTime] as [number, number];
+      }
+      return null;
+    }
+    return historyChartRangeSeconds(data);
+  }, [data, isRealtime, points]);
   const coverageLabel = useMemo(
     () =>
       isRealtime
