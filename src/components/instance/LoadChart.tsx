@@ -549,12 +549,18 @@ export function LoadChart({
     );
   }
 
-  if (!points.length) {
+  if (!isRealtime && !points.length) {
     return (
       <InstancePanel title="负载图表">
-        <div className="instance-empty">
-          {isRealtime ? "等待实时数据..." : "暂无负载历史数据"}
-        </div>
+        <div className="instance-empty">暂无负载历史数据</div>
+      </InstancePanel>
+    );
+  }
+
+  if (isRealtime && points.length < 2) {
+    return (
+      <InstancePanel title="负载图表">
+        <div className="instance-empty">等待实时数据...</div>
       </InstancePanel>
     );
   }
